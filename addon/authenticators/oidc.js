@@ -1,4 +1,4 @@
-import { later } from "@ember/runloop";
+import { cancel, later } from "@ember/runloop";
 import { service } from "@ember/service";
 import { waitForFetch } from "@ember/test-waiters";
 import BaseAuthenticator from "ember-simple-auth/authenticators/base";
@@ -79,6 +79,11 @@ export default class OidcAuthenticator extends BaseAuthenticator {
    * @return {Promise} The invalidate promise
    */
   invalidate() {
+    if (this._upcomingRefresh) {
+      cancel(this._upcomingRefresh);
+      this._upcomingRefresh = null;
+    }
+    this._refreshGeneration = (this._refreshGeneration || 0) + 1;
     return resolve(true);
   }
 
@@ -133,16 +138,24 @@ export default class OidcAuthenticator extends BaseAuthenticator {
    * @returns {Promise} A promise which resolves with the session data
    */
   async restore(sessionData) {
-    const { refresh_token, expireTime, redirectUri } = sessionData;
+    const { refresh_token, access_token, expireTime, redirectUri } =
+      sessionData;
 
     if (!refresh_token) {
       throw new Error("Refresh token is missing");
     }
 
-    if (expireTime && expireTime <= new Date().getTime()) {
+    // Stash refresh_token so _handleAuthResponse can recover it if the
+    // provider doesn't return one in the refresh response.
+    this._lastRefreshToken = refresh_token;
+
+    const needsRefresh =
+      !access_token || !expireTime || expireTime <= new Date().getTime();
+    if (needsRefresh) {
       return await this._refresh(refresh_token, redirectUri);
     }
 
+    this._scheduleRefresh(expireTime, refresh_token);
     return sessionData;
   }
 
@@ -248,6 +261,19 @@ export default class OidcAuthenticator extends BaseAuthenticator {
     id_token,
     redirectUri,
   }) {
+    // Some OIDC providers don't return refresh_token on refresh responses.
+    // Preserve the existing one to prevent session corruption.
+    if (!refresh_token) {
+      refresh_token = this._lastRefreshToken;
+    }
+    if (!refresh_token) {
+      throw new Error(
+        "refresh_token is missing from the token response and could not be " +
+          "recovered. The session will be unable to refresh on next restore.",
+      );
+    }
+    this._lastRefreshToken = refresh_token;
+
     const userinfo = await this._getUserinfo(access_token);
 
     const expireInMilliseconds = expires_in
@@ -255,6 +281,8 @@ export default class OidcAuthenticator extends BaseAuthenticator {
       : this.config.expiresIn;
     const expireTime =
       new Date().getTime() + expireInMilliseconds - this.config.refreshLeeway;
+
+    this._scheduleRefresh(expireTime, refresh_token);
 
     return new TrackedObject({
       access_token,
@@ -264,6 +292,46 @@ export default class OidcAuthenticator extends BaseAuthenticator {
       expireTime,
       redirectUri,
     });
+  }
+
+  /**
+   * Schedule a token refresh before the access token expires.
+   *
+   * @param {Number} expireTime Timestamp (ms) when the access token expires
+   * @param {String} token The refresh token to use
+   */
+  _scheduleRefresh(expireTime, token) {
+    if (!expireTime || expireTime <= new Date().getTime()) {
+      return;
+    }
+
+    if (this._upcomingRefresh) {
+      cancel(this._upcomingRefresh);
+      this._upcomingRefresh = null;
+    }
+
+    const generation = (this._refreshGeneration =
+      (this._refreshGeneration || 0) + 1);
+
+    this._upcomingRefresh = later(
+      this,
+      async (refreshToken) => {
+        try {
+          const data = await this._refresh(refreshToken);
+          if (this._refreshGeneration !== generation || this.isDestroyed) {
+            return;
+          }
+          this._upcomingRefresh = null;
+          this.trigger("sessionDataUpdated", data);
+        } catch {
+          // Don't rethrow — the session will stay with the old token
+          // and the next API call will get a 401, triggering normal
+          // invalidation through the error-handling path.
+        }
+      },
+      token,
+      expireTime - new Date().getTime(),
+    );
   }
 
   /**
