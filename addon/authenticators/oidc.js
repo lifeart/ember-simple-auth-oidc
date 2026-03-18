@@ -1,3 +1,4 @@
+import { debug } from "@ember/debug";
 import { cancel, later } from "@ember/runloop";
 import { service } from "@ember/service";
 import { waitForFetch } from "@ember/test-waiters";
@@ -155,7 +156,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
       return await this._refresh(refresh_token, redirectUri);
     }
 
-    this._scheduleRefresh(expireTime, refresh_token);
+    this._scheduleRefresh(expireTime, refresh_token, redirectUri);
     return sessionData;
   }
 
@@ -282,7 +283,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
     const expireTime =
       new Date().getTime() + expireInMilliseconds - this.config.refreshLeeway;
 
-    this._scheduleRefresh(expireTime, refresh_token);
+    this._scheduleRefresh(expireTime, refresh_token, redirectUri);
 
     return new TrackedObject({
       access_token,
@@ -299,8 +300,9 @@ export default class OidcAuthenticator extends BaseAuthenticator {
    *
    * @param {Number} expireTime Timestamp (ms) when the access token expires
    * @param {String} token The refresh token to use
+   * @param {String} redirectUri The redirect URI for the token endpoint
    */
-  _scheduleRefresh(expireTime, token) {
+  _scheduleRefresh(expireTime, token, redirectUri) {
     if (!expireTime || expireTime <= new Date().getTime()) {
       return;
     }
@@ -317,16 +319,14 @@ export default class OidcAuthenticator extends BaseAuthenticator {
       this,
       async (refreshToken) => {
         try {
-          const data = await this._refresh(refreshToken);
+          const data = await this._refresh(refreshToken, redirectUri);
           if (this._refreshGeneration !== generation || this.isDestroyed) {
             return;
           }
           this._upcomingRefresh = null;
           this.trigger("sessionDataUpdated", data);
-        } catch {
-          // Don't rethrow — the session will stay with the old token
-          // and the next API call will get a 401, triggering normal
-          // invalidation through the error-handling path.
+        } catch (e) {
+          debug(`Scheduled token refresh failed: ${e}`);
         }
       },
       token,
