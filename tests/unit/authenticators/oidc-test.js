@@ -437,4 +437,300 @@ module("Unit | Authenticator | OIDC", function (hooks) {
       );
     });
   });
+
+  module("multi-tab coordination", function () {
+    module("_refresh deduplication", function () {
+      test("it deduplicates concurrent _refresh calls for the same token", async function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        sinon.stub(subject, "_scheduleRefresh");
+
+        let fetchCount = 0;
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = async () => {
+          fetchCount++;
+          return new Response(
+            JSON.stringify({
+              access_token: "new-at",
+              refresh_token: "new-rt",
+              expires_in: 3600,
+              id_token: "id",
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        };
+
+        try {
+          const p1 = subject._refresh("same-rt");
+          const p2 = subject._refresh("same-rt");
+
+          const [r1, r2] = await Promise.all([p1, p2]);
+
+          // Only one fetch should have been made
+          assert.strictEqual(
+            fetchCount,
+            // 2 fetches per _refresh: token POST + userinfo GET
+            2,
+            "Only one token refresh cycle ran (2 fetches: token + userinfo)",
+          );
+          assert.strictEqual(r1.access_token, "new-at");
+          assert.strictEqual(r2.access_token, "new-at");
+        } finally {
+          globalThis.fetch = originalFetch;
+        }
+      });
+
+      test("it does NOT deduplicate _refresh calls for different tokens", async function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        sinon.stub(subject, "_scheduleRefresh");
+
+        let fetchCount = 0;
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = async () => {
+          fetchCount++;
+          return new Response(
+            JSON.stringify({
+              access_token: "new-at",
+              refresh_token: "new-rt",
+              expires_in: 3600,
+              id_token: "id",
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        };
+
+        try {
+          await Promise.all([
+            subject._refresh("rt-A"),
+            subject._refresh("rt-B"),
+          ]);
+
+          // 2 fetches per _refresh call × 2 calls = 4
+          assert.strictEqual(
+            fetchCount,
+            4,
+            "Two separate refresh cycles ran for different tokens",
+          );
+        } finally {
+          globalThis.fetch = originalFetch;
+        }
+      });
+
+      test("dedup clears after completion — subsequent call makes a new request", async function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        sinon.stub(subject, "_scheduleRefresh");
+
+        let fetchCount = 0;
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = async () => {
+          fetchCount++;
+          return new Response(
+            JSON.stringify({
+              access_token: "new-at",
+              refresh_token: "new-rt",
+              expires_in: 3600,
+              id_token: "id",
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        };
+
+        try {
+          await subject._refresh("rt-1");
+          assert.strictEqual(fetchCount, 2, "First refresh: 2 fetches");
+          assert.strictEqual(
+            subject._inflightRefresh,
+            null,
+            "In-flight state cleared after first refresh",
+          );
+
+          await subject._refresh("rt-1");
+          assert.strictEqual(
+            fetchCount,
+            4,
+            "Second refresh: 2 more fetches (not deduped)",
+          );
+        } finally {
+          globalThis.fetch = originalFetch;
+        }
+      });
+
+      test("dedup propagates failure to both callers", async function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        sinon.stub(subject, "_scheduleRefresh");
+
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = async () => {
+          return new Response(JSON.stringify({ error: "invalid_grant" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        };
+
+        try {
+          const errors = [];
+
+          const p1 = subject._refresh("same-rt").catch((e) => {
+            errors.push(e);
+          });
+          const p2 = subject._refresh("same-rt").catch((e) => {
+            errors.push(e);
+          });
+
+          await Promise.all([p1, p2]);
+
+          assert.strictEqual(
+            errors.length,
+            2,
+            "Both callers received the rejection",
+          );
+        } finally {
+          globalThis.fetch = originalFetch;
+        }
+      });
+    });
+
+    module("invalidate clears dedup state", function () {
+      test("it clears _inflightRefresh and _inflightRefreshToken", async function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+
+        // Simulate in-flight state
+        subject._inflightRefresh = Promise.resolve();
+        subject._inflightRefreshToken = "rt";
+
+        await subject.invalidate();
+
+        assert.strictEqual(
+          subject._inflightRefresh,
+          null,
+          "_inflightRefresh cleared",
+        );
+        assert.strictEqual(
+          subject._inflightRefreshToken,
+          null,
+          "_inflightRefreshToken cleared",
+        );
+      });
+    });
+
+    module("refresh jitter", function () {
+      test("_refreshJitter returns a value in [0, 15000)", function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        for (let i = 0; i < 100; i++) {
+          const jitter = subject._refreshJitter();
+          assert.ok(jitter >= 0, `jitter ${jitter} >= 0`);
+          assert.ok(jitter < 15000, `jitter ${jitter} < 15000`);
+        }
+      });
+
+      test("_refreshJitter is called when scheduling", function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        let called = false;
+        subject._refreshJitter = () => {
+          called = true;
+          return 0;
+        };
+
+        subject._scheduleRefresh(
+          new Date().getTime() + 60000,
+          "token",
+          "test",
+        );
+        assert.true(called, "_refreshJitter was invoked");
+
+        // Clean up
+        cancel(subject._upcomingRefresh);
+        subject._upcomingRefresh = null;
+      });
+    });
+
+    module("multi-tab guard in _scheduleRefresh callback", function () {
+      test("it skips refresh when session token was updated by another tab", async function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        subject._refreshJitter = () => 0;
+
+        let refreshCalled = false;
+        sinon.stub(subject, "_refresh").callsFake(() => {
+          refreshCalled = true;
+          return Promise.resolve({});
+        });
+
+        // Track re-schedule calls
+        const reScheduleCalls = [];
+        const originalSchedule = subject._scheduleRefresh.bind(subject);
+        let callCount = 0;
+        subject._scheduleRefresh = function (expireTime, token, rUri) {
+          callCount++;
+          if (callCount === 1) {
+            return originalSchedule(expireTime, token, rUri);
+          }
+          reScheduleCalls.push({ expireTime, token });
+        };
+
+        // Schedule with 'old-rt' — fires in ~10ms
+        subject._scheduleRefresh(new Date().getTime() + 10, "old-rt", "test");
+
+        // Simulate another tab updating the session
+        const session = this.owner.lookup("service:session");
+        const futureExpire = new Date().getTime() + 60000;
+        session.set("data", {
+          authenticated: {
+            refresh_token: "new-rt-from-other-tab",
+            expireTime: futureExpire,
+          },
+        });
+
+        // Wait for timer
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        assert.false(refreshCalled, "_refresh was NOT called");
+        assert.strictEqual(reScheduleCalls.length, 1, "Re-scheduled once");
+        assert.strictEqual(
+          reScheduleCalls[0].token,
+          "new-rt-from-other-tab",
+          "Re-scheduled with the new token",
+        );
+
+        // Clean up
+        subject.invalidate();
+      });
+
+      test("it proceeds when session token matches (no other tab refreshed)", async function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        subject._refreshJitter = () => 0;
+
+        let refreshCalledWith = null;
+        sinon.stub(subject, "_refresh").callsFake((token) => {
+          refreshCalledWith = token;
+          return Promise.resolve({
+            access_token: "at",
+            refresh_token: "rt",
+            expireTime: new Date().getTime() + 60000,
+          });
+        });
+
+        // Session has the SAME token
+        const session = this.owner.lookup("service:session");
+        session.set("data", {
+          authenticated: { refresh_token: "same-rt" },
+        });
+
+        subject._scheduleRefresh(new Date().getTime() + 10, "same-rt", "test");
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        assert.strictEqual(refreshCalledWith, "same-rt", "_refresh was called");
+
+        subject.invalidate();
+      });
+    });
+  });
 });

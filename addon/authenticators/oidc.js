@@ -13,6 +13,12 @@ import {
   isBadRequestResponse,
 } from "ember-simple-auth-oidc/utils/errors";
 
+// Random jitter added to the scheduled refresh delay so that multiple browser
+// tabs don't all fire their timer at the exact same millisecond.  Must be
+// strictly less than the configured refreshLeeway so the refresh always fires
+// before the actual token expiry.
+const REFRESH_JITTER_MAX_MS = 15000;
+
 export default class OidcAuthenticator extends BaseAuthenticator {
   @service router;
   @service session;
@@ -85,6 +91,10 @@ export default class OidcAuthenticator extends BaseAuthenticator {
       this._upcomingRefresh = null;
     }
     this._refreshGeneration = (this._refreshGeneration || 0) + 1;
+    // Clear in-flight dedup state so a stale resolved/rejected promise is
+    // never returned to a caller after the session has been invalidated.
+    this._inflightRefresh = null;
+    this._inflightRefreshToken = null;
     return resolve(true);
   }
 
@@ -167,6 +177,33 @@ export default class OidcAuthenticator extends BaseAuthenticator {
    * @returns {Object} The parsed response data
    */
   async _refresh(
+    refresh_token,
+    redirectUri,
+    retryCount = 0,
+    customParams = {},
+  ) {
+    // Deduplicate concurrent refresh calls within the same tab.  If a refresh
+    // is already in-flight for the same token, return the existing promise
+    // instead of firing a second request that would race at the OIDC provider.
+    if (this._inflightRefresh && this._inflightRefreshToken === refresh_token) {
+      return this._inflightRefresh;
+    }
+
+    this._inflightRefreshToken = refresh_token;
+    this._inflightRefresh = this.__doRefresh(
+      refresh_token,
+      redirectUri,
+      retryCount,
+      customParams,
+    ).finally(() => {
+      this._inflightRefresh = null;
+      this._inflightRefreshToken = null;
+    });
+
+    return this._inflightRefresh;
+  }
+
+  async __doRefresh(
     refresh_token,
     redirectUri,
     retryCount = 0,
@@ -302,6 +339,14 @@ export default class OidcAuthenticator extends BaseAuthenticator {
    * @param {String} token The refresh token to use
    * @param {String} redirectUri The redirect URI for the token endpoint
    */
+  /**
+   * Return a random jitter in [0, REFRESH_JITTER_MAX_MS) to spread scheduled
+   * refreshes across tabs.  Overridable in tests for determinism.
+   */
+  _refreshJitter() {
+    return Math.floor(Math.random() * REFRESH_JITTER_MAX_MS);
+  }
+
   _scheduleRefresh(expireTime, token, redirectUri) {
     if (!expireTime || expireTime <= new Date().getTime()) {
       return;
@@ -319,6 +364,28 @@ export default class OidcAuthenticator extends BaseAuthenticator {
       this,
       async (refreshToken) => {
         try {
+          // Multi-tab guard: before refreshing, check if another tab already
+          // refreshed the token.  All tabs share the session store (typically
+          // localStorage), so if the current session's refresh_token differs
+          // from the one captured in this closure, another tab won the race.
+          const currentRefreshToken =
+            this.session?.data?.authenticated?.refresh_token;
+          if (currentRefreshToken && currentRefreshToken !== refreshToken) {
+            debug(
+              "Scheduled refresh skipped — another tab already refreshed the token",
+            );
+            const currentExpireTime =
+              this.session?.data?.authenticated?.expireTime;
+            if (currentExpireTime && currentExpireTime > new Date().getTime()) {
+              this._scheduleRefresh(
+                currentExpireTime,
+                currentRefreshToken,
+                redirectUri,
+              );
+            }
+            return;
+          }
+
           const data = await this._refresh(refreshToken, redirectUri);
           if (this._refreshGeneration !== generation || this.isDestroyed) {
             return;
@@ -330,7 +397,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
         }
       },
       token,
-      expireTime - new Date().getTime(),
+      expireTime - new Date().getTime() + this._refreshJitter(),
     );
   }
 
