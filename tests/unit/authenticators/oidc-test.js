@@ -703,7 +703,7 @@ module("Unit | Authenticator | OIDC", function (hooks) {
         subject.invalidate();
       });
 
-      test("it proceeds when session token matches (no other tab refreshed)", async function (assert) {
+      test("it proceeds when session data matches (no other tab refreshed)", async function (assert) {
         const subject = this.owner.lookup("authenticator:oidc");
         subject._refreshJitter = () => 0;
 
@@ -717,17 +717,78 @@ module("Unit | Authenticator | OIDC", function (hooks) {
           });
         });
 
-        // Session has the SAME token
+        // Session has the SAME token AND expireTime
+        const scheduleTime = new Date().getTime() + 10;
         const session = this.owner.lookup("service:session");
         session.set("data", {
-          authenticated: { refresh_token: "same-rt" },
+          authenticated: {
+            refresh_token: "same-rt",
+            expireTime: scheduleTime,
+          },
         });
 
-        subject._scheduleRefresh(new Date().getTime() + 10, "same-rt", "test");
+        subject._scheduleRefresh(scheduleTime, "same-rt", "test");
 
         await new Promise((resolve) => setTimeout(resolve, 50));
 
         assert.strictEqual(refreshCalledWith, "same-rt", "_refresh was called");
+
+        subject.invalidate();
+      });
+
+      test("it skips refresh when refresh_token is same but expireTime changed (no token rotation)", async function (assert) {
+        const subject = this.owner.lookup("authenticator:oidc");
+        subject._refreshJitter = () => 0;
+
+        let refreshCalled = false;
+        sinon.stub(subject, "_refresh").callsFake(() => {
+          refreshCalled = true;
+          return Promise.resolve({});
+        });
+
+        const reScheduleCalls = [];
+        const originalSchedule = subject._scheduleRefresh.bind(subject);
+        let callCount = 0;
+        subject._scheduleRefresh = function (expireTime, token, rUri) {
+          callCount++;
+          if (callCount === 1) {
+            return originalSchedule(expireTime, token, rUri);
+          }
+          reScheduleCalls.push({ expireTime, token });
+        };
+
+        const originalExpireTime = new Date().getTime() + 10;
+        const session = this.owner.lookup("service:session");
+        session.set("data", {
+          authenticated: {
+            refresh_token: "non-rotating-rt",
+            expireTime: originalExpireTime,
+          },
+        });
+
+        subject._scheduleRefresh(originalExpireTime, "non-rotating-rt", "test");
+
+        // Another tab refreshed — same refresh_token but new expireTime
+        const newExpireTime = new Date().getTime() + 60000;
+        session.set("data", {
+          authenticated: {
+            refresh_token: "non-rotating-rt",
+            expireTime: newExpireTime,
+          },
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        assert.false(
+          refreshCalled,
+          "_refresh was NOT called — guard detected expireTime change",
+        );
+        assert.strictEqual(reScheduleCalls.length, 1, "Re-scheduled once");
+        assert.strictEqual(
+          reScheduleCalls[0].expireTime,
+          newExpireTime,
+          "Re-scheduled with the new expireTime",
+        );
 
         subject.invalidate();
       });

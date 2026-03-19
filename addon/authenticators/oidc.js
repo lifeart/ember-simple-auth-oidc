@@ -360,26 +360,37 @@ export default class OidcAuthenticator extends BaseAuthenticator {
     const generation = (this._refreshGeneration =
       (this._refreshGeneration || 0) + 1);
 
+    // Capture the expireTime we used to schedule this timer.  When the
+    // callback fires we compare it against the session store's current
+    // expireTime — if they differ, another tab already refreshed.
+    // expireTime is the most reliable signal because it changes on every
+    // refresh regardless of whether the OIDC provider rotates refresh tokens.
+    const scheduledExpireTime = expireTime;
+
     this._upcomingRefresh = later(
       this,
       async (refreshToken) => {
         try {
-          // Multi-tab guard: before refreshing, check if another tab already
-          // refreshed the token.  All tabs share the session store (typically
-          // localStorage), so if the current session's refresh_token differs
-          // from the one captured in this closure, another tab won the race.
+          // Multi-tab guard: check if another tab already refreshed.
+          // We compare both expireTime (always changes) and refresh_token
+          // (changes with token rotation).  Either difference means
+          // another tab already refreshed — skip to avoid racing.
+          const currentExpireTime =
+            this.session?.data?.authenticated?.expireTime;
           const currentRefreshToken =
             this.session?.data?.authenticated?.refresh_token;
-          if (currentRefreshToken && currentRefreshToken !== refreshToken) {
+          const anotherTabRefreshed =
+            (currentExpireTime && currentExpireTime !== scheduledExpireTime) ||
+            (currentRefreshToken && currentRefreshToken !== refreshToken);
+
+          if (anotherTabRefreshed) {
             debug(
-              "Scheduled refresh skipped — another tab already refreshed the token",
+              "Scheduled refresh skipped — another tab already refreshed",
             );
-            const currentExpireTime =
-              this.session?.data?.authenticated?.expireTime;
             if (currentExpireTime && currentExpireTime > new Date().getTime()) {
               this._scheduleRefresh(
                 currentExpireTime,
-                currentRefreshToken,
+                currentRefreshToken || refreshToken,
                 redirectUri,
               );
             }
