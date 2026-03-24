@@ -445,8 +445,8 @@ module("Unit | Authenticator | OIDC", function (hooks) {
         sinon.stub(subject, "_scheduleRefresh");
 
         let fetchCount = 0;
-        const originalFetch = globalThis.fetch;
-        globalThis.fetch = async () => {
+        const originalFetch = window.fetch;
+        window.fetch = async () => {
           fetchCount++;
           return new Response(
             JSON.stringify({
@@ -478,7 +478,7 @@ module("Unit | Authenticator | OIDC", function (hooks) {
           assert.strictEqual(r1.access_token, "new-at");
           assert.strictEqual(r2.access_token, "new-at");
         } finally {
-          globalThis.fetch = originalFetch;
+          window.fetch = originalFetch;
         }
       });
 
@@ -487,8 +487,8 @@ module("Unit | Authenticator | OIDC", function (hooks) {
         sinon.stub(subject, "_scheduleRefresh");
 
         let fetchCount = 0;
-        const originalFetch = globalThis.fetch;
-        globalThis.fetch = async () => {
+        const originalFetch = window.fetch;
+        window.fetch = async () => {
           fetchCount++;
           return new Response(
             JSON.stringify({
@@ -517,7 +517,7 @@ module("Unit | Authenticator | OIDC", function (hooks) {
             "Two separate refresh cycles ran for different tokens",
           );
         } finally {
-          globalThis.fetch = originalFetch;
+          window.fetch = originalFetch;
         }
       });
 
@@ -526,8 +526,8 @@ module("Unit | Authenticator | OIDC", function (hooks) {
         sinon.stub(subject, "_scheduleRefresh");
 
         let fetchCount = 0;
-        const originalFetch = globalThis.fetch;
-        globalThis.fetch = async () => {
+        const originalFetch = window.fetch;
+        window.fetch = async () => {
           fetchCount++;
           return new Response(
             JSON.stringify({
@@ -559,7 +559,7 @@ module("Unit | Authenticator | OIDC", function (hooks) {
             "Second refresh: 2 more fetches (not deduped)",
           );
         } finally {
-          globalThis.fetch = originalFetch;
+          window.fetch = originalFetch;
         }
       });
 
@@ -567,8 +567,8 @@ module("Unit | Authenticator | OIDC", function (hooks) {
         const subject = this.owner.lookup("authenticator:oidc");
         sinon.stub(subject, "_scheduleRefresh");
 
-        const originalFetch = globalThis.fetch;
-        globalThis.fetch = async () => {
+        const originalFetch = window.fetch;
+        window.fetch = async () => {
           return new Response(JSON.stringify({ error: "invalid_grant" }), {
             status: 400,
             headers: { "Content-Type": "application/json" },
@@ -593,7 +593,7 @@ module("Unit | Authenticator | OIDC", function (hooks) {
             "Both callers received the rejection",
           );
         } finally {
-          globalThis.fetch = originalFetch;
+          window.fetch = originalFetch;
         }
       });
     });
@@ -622,12 +622,13 @@ module("Unit | Authenticator | OIDC", function (hooks) {
     });
 
     module("refresh jitter", function () {
-      test("_refreshJitter returns a value in [0, 15000)", function (assert) {
+      test("_refreshJitter returns a value in [0, refreshLeeway)", function (assert) {
         const subject = this.owner.lookup("authenticator:oidc");
+        const maxJitter = subject.config.refreshLeeway;
         for (let i = 0; i < 100; i++) {
           const jitter = subject._refreshJitter();
           assert.ok(jitter >= 0, `jitter ${jitter} >= 0`);
-          assert.ok(jitter < 15000, `jitter ${jitter} < 15000`);
+          assert.ok(jitter < maxJitter, `jitter ${jitter} < ${maxJitter}`);
         }
       });
 
@@ -639,11 +640,7 @@ module("Unit | Authenticator | OIDC", function (hooks) {
           return 0;
         };
 
-        subject._scheduleRefresh(
-          new Date().getTime() + 60000,
-          "token",
-          "test",
-        );
+        subject._scheduleRefresh(new Date().getTime() + 60000, "token", "test");
         assert.true(called, "_refreshJitter was invoked");
 
         // Clean up
@@ -681,11 +678,9 @@ module("Unit | Authenticator | OIDC", function (hooks) {
         // Simulate another tab updating the session
         const session = this.owner.lookup("service:session");
         const futureExpire = new Date().getTime() + 60000;
-        session.set("data", {
-          authenticated: {
-            refresh_token: "new-rt-from-other-tab",
-            expireTime: futureExpire,
-          },
+        set(session, "data.authenticated", {
+          refresh_token: "new-rt-from-other-tab",
+          expireTime: futureExpire,
         });
 
         // Wait for timer
@@ -720,11 +715,9 @@ module("Unit | Authenticator | OIDC", function (hooks) {
         // Session has the SAME token AND expireTime
         const scheduleTime = new Date().getTime() + 10;
         const session = this.owner.lookup("service:session");
-        session.set("data", {
-          authenticated: {
-            refresh_token: "same-rt",
-            expireTime: scheduleTime,
-          },
+        set(session, "data.authenticated", {
+          refresh_token: "same-rt",
+          expireTime: scheduleTime,
         });
 
         subject._scheduleRefresh(scheduleTime, "same-rt", "test");
@@ -759,22 +752,18 @@ module("Unit | Authenticator | OIDC", function (hooks) {
 
         const originalExpireTime = new Date().getTime() + 10;
         const session = this.owner.lookup("service:session");
-        session.set("data", {
-          authenticated: {
-            refresh_token: "non-rotating-rt",
-            expireTime: originalExpireTime,
-          },
+        set(session, "data.authenticated", {
+          refresh_token: "non-rotating-rt",
+          expireTime: originalExpireTime,
         });
 
         subject._scheduleRefresh(originalExpireTime, "non-rotating-rt", "test");
 
         // Another tab refreshed — same refresh_token but new expireTime
         const newExpireTime = new Date().getTime() + 60000;
-        session.set("data", {
-          authenticated: {
-            refresh_token: "non-rotating-rt",
-            expireTime: newExpireTime,
-          },
+        set(session, "data.authenticated", {
+          refresh_token: "non-rotating-rt",
+          expireTime: newExpireTime,
         });
 
         await new Promise((resolve) => setTimeout(resolve, 50));

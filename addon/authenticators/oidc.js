@@ -13,11 +13,7 @@ import {
   isBadRequestResponse,
 } from "ember-simple-auth-oidc/utils/errors";
 
-// Random jitter added to the scheduled refresh delay so that multiple browser
-// tabs don't all fire their timer at the exact same millisecond.  Must be
-// strictly less than the configured refreshLeeway so the refresh always fires
-// before the actual token expiry.
-const REFRESH_JITTER_MAX_MS = 15000;
+const REFRESH_JITTER_FALLBACK_MS = 15000;
 
 export default class OidcAuthenticator extends BaseAuthenticator {
   @service router;
@@ -333,20 +329,21 @@ export default class OidcAuthenticator extends BaseAuthenticator {
   }
 
   /**
+   * Return a random jitter in [0, maxJitter) to spread scheduled
+   * refreshes across tabs.  Overridable in tests for determinism.
+   */
+  _refreshJitter() {
+    const maxJitter = this.config.refreshLeeway || REFRESH_JITTER_FALLBACK_MS;
+    return Math.floor(Math.random() * maxJitter);
+  }
+
+  /**
    * Schedule a token refresh before the access token expires.
    *
    * @param {Number} expireTime Timestamp (ms) when the access token expires
    * @param {String} token The refresh token to use
    * @param {String} redirectUri The redirect URI for the token endpoint
    */
-  /**
-   * Return a random jitter in [0, REFRESH_JITTER_MAX_MS) to spread scheduled
-   * refreshes across tabs.  Overridable in tests for determinism.
-   */
-  _refreshJitter() {
-    return Math.floor(Math.random() * REFRESH_JITTER_MAX_MS);
-  }
-
   _scheduleRefresh(expireTime, token, redirectUri) {
     if (!expireTime || expireTime <= new Date().getTime()) {
       return;
@@ -384,9 +381,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
             (currentRefreshToken && currentRefreshToken !== refreshToken);
 
           if (anotherTabRefreshed) {
-            debug(
-              "Scheduled refresh skipped — another tab already refreshed",
-            );
+            debug("Scheduled refresh skipped — another tab already refreshed");
             if (currentExpireTime && currentExpireTime > new Date().getTime()) {
               this._scheduleRefresh(
                 currentExpireTime,
